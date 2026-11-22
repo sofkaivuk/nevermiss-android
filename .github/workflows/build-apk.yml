@@ -26,6 +26,46 @@ jobs:
         with:
           gradle-version: '8.13'
       - run: unzip -q NeverMiss-Android-v0.1-source.zip
+
+      # First-build compatibility fixes for the source ZIP currently in this repository.
+      - name: Fix Kotlin / Firebase compilation issues
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          base = Path('NeverMiss-Android/app')
+          activity = base / 'src/main/java/com/nevermiss/app/MainActivity.kt'
+          text = activity.read_text()
+          text = text.replace(
+              'import androidx.compose.foundation.layout.rememberScrollState',
+              'import androidx.compose.foundation.rememberScrollState'
+          ).replace(
+              'import androidx.compose.foundation.layout.verticalScroll',
+              'import androidx.compose.foundation.verticalScroll'
+          )
+          activity.write_text(text)
+
+          vm = base / 'src/main/java/com/nevermiss/app/MainViewModel.kt'
+          text = vm.read_text()
+          text = text.replace(
+              'import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL\n',
+              ''
+          ).replace(
+              'credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL',
+              'credential.type == "com.google.android.libraries.identity.googleid.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL"'
+          )
+          vm.write_text(text)
+
+          gradle = base / 'build.gradle.kts'
+          text = gradle.read_text()
+          text += '\n// Pin Firebase Auth to a version compatible with Kotlin 2.2.x.\n'
+          text += 'configurations.configureEach {\n'
+          text += '    resolutionStrategy.force("com.google.firebase:firebase-auth:24.0.1")\n'
+          text += '}\n'
+          gradle.write_text(text)
+          PY
+
       - name: Compile signed debug APK
         working-directory: NeverMiss-Android
         run: gradle :app:assembleDebug --no-daemon --stacktrace
@@ -35,3 +75,4 @@ jobs:
           path: NeverMiss-Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
+          
