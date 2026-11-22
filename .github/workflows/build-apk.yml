@@ -27,25 +27,19 @@ jobs:
           gradle-version: '8.13'
       - run: unzip -q NeverMiss-Android-v0.1-source.zip
 
-      # First-build compatibility fixes for the source ZIP currently in this repository.
-      - name: Fix Kotlin / Firebase compilation issues
+      - name: Fix initial Kotlin and Firebase compilation problems
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
           base = Path('NeverMiss-Android/app')
           activity = base / 'src/main/java/com/nevermiss/app/MainActivity.kt'
           text = activity.read_text()
-          text = text.replace(
-              'import androidx.compose.foundation.layout.rememberScrollState',
-              'import androidx.compose.foundation.rememberScrollState'
-          ).replace(
-              'import androidx.compose.foundation.layout.verticalScroll',
-              'import androidx.compose.foundation.verticalScroll'
-          )
+          text = text.replace('import androidx.compose.foundation.layout.rememberScrollState',
+                              'import androidx.compose.foundation.rememberScrollState')
+          text = text.replace('import androidx.compose.foundation.layout.verticalScroll',
+                              'import androidx.compose.foundation.verticalScroll')
           activity.write_text(text)
-
           vm = base / 'src/main/java/com/nevermiss/app/MainViewModel.kt'
           text = vm.read_text()
           text = text.replace(
@@ -56,14 +50,313 @@ jobs:
               'credential.type == "com.google.android.libraries.identity.googleid.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL"'
           )
           vm.write_text(text)
-
           gradle = base / 'build.gradle.kts'
           text = gradle.read_text()
-          text += '\n// Pin Firebase Auth to a version compatible with Kotlin 2.2.x.\n'
+          text += '\n// Keep Firebase Auth compatible with Kotlin 2.2.x.\n'
           text += 'configurations.configureEach {\n'
           text += '    resolutionStrategy.force("com.google.firebase:firebase-auth:24.0.1")\n'
           text += '}\n'
           gradle.write_text(text)
+          PY
+
+      - name: Add custom reminder days and optional reminder time
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Patch the original NeverMiss Android v0.1 source at build time.
+          Adds per-event reminder day offsets and an optional local reminder time.
+          """
+          from pathlib import Path
+
+          BASE = Path('NeverMiss-Android/app/src/main/java/com/nevermiss/app')
+
+
+          def replace_exact(file: Path, old: str, new: str):
+              source = file.read_text(encoding='utf-8')
+              if old not in source:
+                  raise RuntimeError(f"Expected source snippet not found in {file}: {old[:140]!r}")
+              if source.count(old) != 1:
+                  raise RuntimeError(f"Expected one match in {file}, got {source.count(old)}: {old[:100]!r}")
+              file.write_text(source.replace(old, new), encoding='utf-8')
+              print(f"Updated {file.name}")
+
+
+          # 1. Store configurable reminder offsets and minutes since midnight.
+          store = BASE / 'LocalStore.kt'
+          replace_exact(store,
+              '    val note: String = "",\n    val updatedAt: Long = System.currentTimeMillis(),',
+              '    val note: String = "",\n'
+              '    val reminderDays: String? = null, // null keeps original default: 7, 1, 0\n'
+              '    val reminderMinuteOfDay: Int? = null, // null keeps ~09:00 local time\n'
+              '    val updatedAt: Long = System.currentTimeMillis(),')
+          replace_exact(store,
+              '@Database(entities = [Occasion::class, DeliveryRecord::class], version = 1, exportSchema = false)',
+              '@Database(entities = [Occasion::class, DeliveryRecord::class], version = 2, exportSchema = false)')
+
+          # 2. Add a non-destructive v1 -> v2 migration so users keep all saved dates.
+          cloud = BASE / 'CloudSync.kt'
+          replace_exact(cloud,
+              'import androidx.room.Room\n',
+              'import androidx.room.Room\n'
+              'import androidx.room.migration.Migration\n'
+              'import androidx.sqlite.SQLiteConnection\n'
+              'import androidx.sqlite.execSQL\n')
+          replace_exact(cloud,
+              'class NeverMissApplication : Application() {\n',
+              'private val MIGRATION_1_2 = object : Migration(1, 2) {\n'
+              '    override fun migrate(connection: SQLiteConnection) {\n'
+              '        connection.execSQL("ALTER TABLE occasions ADD COLUMN reminderDays TEXT")\n'
+              '        connection.execSQL("ALTER TABLE occasions ADD COLUMN reminderMinuteOfDay INTEGER")\n'
+              '    }\n'
+              '}\n\n'
+              'class NeverMissApplication : Application() {\n')
+          replace_exact(cloud,
+              'Room.databaseBuilder(this, NeverMissDatabase::class.java, "nevermiss.db").build()',
+              'Room.databaseBuilder(this, NeverMissDatabase::class.java, "nevermiss.db")\n'
+              '            .addMigrations(MIGRATION_1_2).build()')
+          replace_exact(cloud,
+              '        "note" to e.note, "updatedAt" to e.updatedAt, "deletedAt" to e.deletedAt',
+              '        "note" to e.note, "updatedAt" to e.updatedAt, "deletedAt" to e.deletedAt,\n'
+              '        "reminderDays" to e.reminderDays, "reminderMinuteOfDay" to e.reminderMinuteOfDay')
+          replace_exact(cloud,
+              '        return Occasion(id = id, ownerUid = uid, title = title,',
+              '        val reminderDays = (map["reminderDays"] as? String)?.also {\n'
+              '            DateRules.parseReminderDays(it) // reject corrupt cloud data\n'
+              '        }\n'
+              '        val reminderMinuteOfDay = (map["reminderMinuteOfDay"] as? Number)?.toInt()\n'
+              '        if (reminderMinuteOfDay != null && reminderMinuteOfDay !in 0..1439) return null\n'
+              '        return Occasion(id = id, ownerUid = uid, title = title,')
+          replace_exact(cloud,
+              '            note = (map["note"] as? String) ?: "",\n',
+              '            note = (map["note"] as? String) ?: "",\n'
+              '            reminderDays = reminderDays, reminderMinuteOfDay = reminderMinuteOfDay,\n')
+
+          # 3. Validate/normalize custom reminder dates.
+          rules = BASE / 'DateRules.kt'
+          replace_exact(rules,
+              '    val supportedReminders = listOf(7, 1, 0)\n',
+              '    val supportedReminders = listOf(7, 1, 0)\n\n'
+              '    fun parseReminderDays(input: String): List<Int> {\n'
+              '        val parts = input.split(",")\n'
+              '        require(parts.size in 1..12) { "Choose 1 to 12 reminder days" }\n'
+              '        val days = parts.map { token ->\n'
+              '            val value = token.trim().toIntOrNull()\n'
+              '            require(value != null && value in 0..365) { "Enter days from 0 to 365, separated by commas" }\n'
+              '            value\n'
+              '        }\n'
+              '        require(days.size == days.distinct().size) { "Do not repeat the same number of days" }\n'
+              '        return days.sortedDescending()\n'
+              '    }\n\n'
+              '    fun reminderDays(custom: String?): List<Int> =\n'
+              '        if (custom == null) supportedReminders else parseReminderDays(custom)\n')
+
+          # 4. Set per-event values on Save.
+          vm = BASE / 'MainViewModel.kt'
+          replace_exact(vm,
+              '        month: Int, day: Int, paschaOffset: Int, note: String\n',
+              '        month: Int, day: Int, paschaOffset: Int, note: String,\n'
+              '        reminderDays: String?, reminderMinuteOfDay: Int?\n')
+          replace_exact(vm,
+              '                DateRules.occurrence(2028, rule, month, day, paschaOffset)\n',
+              '                DateRules.occurrence(2028, rule, month, day, paschaOffset)\n'
+              '                val validDays = reminderDays?.let { DateRules.parseReminderDays(it).joinToString(",") }\n'
+              '                require(reminderMinuteOfDay == null || reminderMinuteOfDay in 0..1439)\n')
+          replace_exact(vm,
+              '                    note = note.trim(), updatedAt = now, dirty = true\n',
+              '                    note = note.trim(), reminderDays = validDays,\n'
+              '                    reminderMinuteOfDay = reminderMinuteOfDay,\n'
+              '                    updatedAt = now, dirty = true\n')
+
+          # 5. Keep reminders in manual JSON export/import (backward compatible with v1).
+          backup = BASE / 'BackupCodec.kt'
+          replace_exact(backup,
+              '                put("note", event.note)\n',
+              '                put("note", event.note)\n'
+              '                put("reminderDays", event.reminderDays)\n'
+              '                put("reminderMinuteOfDay", event.reminderMinuteOfDay)\n')
+          replace_exact(backup,
+              '            .put("version", 1)\n',
+              '            .put("version", 2)\n')
+          replace_exact(backup,
+              '        require(root.optInt("version") == 1) { "Unsupported backup version" }\n',
+              '        require(root.optInt("version") in 1..2) { "Unsupported backup version" }\n')
+          replace_exact(backup,
+              '            Occasion(id = id, title = title, category = category, rule = rule,\n'
+              '                month = month, day = day, paschaOffset = offset, note = note)\n',
+              '            val reminderDays = if (item.has("reminderDays") && !item.isNull("reminderDays")) {\n'
+              '                item.getString("reminderDays").also { DateRules.parseReminderDays(it) }\n'
+              '            } else null\n'
+              '            val reminderMinute = if (item.has("reminderMinuteOfDay") && !item.isNull("reminderMinuteOfDay")) {\n'
+              '                item.getInt("reminderMinuteOfDay").also { require(it in 0..1439) }\n'
+              '            } else null\n'
+              '            Occasion(id = id, title = title, category = category, rule = rule,\n'
+              '                month = month, day = day, paschaOffset = offset, note = note,\n'
+              '                reminderDays = reminderDays, reminderMinuteOfDay = reminderMinute)\n')
+
+          # 6. Schedule one inexact daily alarm for each distinct selected reminder time.
+          reminders = BASE / 'ReminderJobs.kt'
+          replace_exact(reminders,
+              '    private const val ALARM_REQUEST = 92832\n',
+              '    private const val ALARM_REQUEST = 92832\n'
+              '    private const val TIME_PREFS = "nevermiss-alarm-times"\n')
+          start = reminders.read_text(encoding='utf-8')
+          old = '''    fun scheduleDaily(context: Context) {
+                  val alarmManager = context.getSystemService(AlarmManager::class.java)
+                  val intent = Intent(context, ReminderAlarmReceiver::class.java)
+                  val pending = PendingIntent.getBroadcast(context, ALARM_REQUEST, intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                  // Intentionally inexact: we do not request restricted exact-alarm permissions.
+                  val next = DateRules.nextAlarm(ZonedDateTime.now()).toInstant().toEpochMilli()
+                  alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next, pending)
+              }
+          '''
+          new = '''    private fun alarmPending(context: Context, minuteOfDay: Int, noCreate: Boolean = false): PendingIntent? {
+                  val intent = Intent(context, ReminderAlarmReceiver::class.java)
+                      .putExtra("reminderMinuteOfDay", minuteOfDay)
+                  val flags = (if (noCreate) PendingIntent.FLAG_NO_CREATE else PendingIntent.FLAG_UPDATE_CURRENT) or
+                      PendingIntent.FLAG_IMMUTABLE
+                  return PendingIntent.getBroadcast(context, ALARM_REQUEST + minuteOfDay, intent, flags)
+              }
+
+              fun scheduleTime(context: Context, minuteOfDay: Int) {
+                  if (minuteOfDay !in 0..1439) return
+                  val now = ZonedDateTime.now()
+                  val todayAtTime = now.toLocalDate().atTime(minuteOfDay / 60, minuteOfDay % 60)
+                      .atZone(now.zone)
+                  val next = if (todayAtTime.isAfter(now)) todayAtTime else todayAtTime.plusDays(1)
+                  val pending = alarmPending(context, minuteOfDay) ?: return
+                  // Inexact by design; Android may delay delivery in battery saving mode.
+                  context.getSystemService(AlarmManager::class.java).setAndAllowWhileIdle(
+                      AlarmManager.RTC_WAKEUP, next.toInstant().toEpochMilli(), pending)
+              }
+
+              fun scheduleDaily(context: Context) = scheduleTime(context, 9 * 60)
+
+              fun reconcileTimeAlarms(context: Context, events: List<Occasion>) {
+                  val target = (events.mapNotNull { it.reminderMinuteOfDay } + 540).toSet()
+                  val prefs = context.getSharedPreferences(TIME_PREFS, Context.MODE_PRIVATE)
+                  val existing = prefs.getString("times", "")!!.split(",").mapNotNull { it.toIntOrNull() }.toSet()
+                  val alarm = context.getSystemService(AlarmManager::class.java)
+                  (existing - target).forEach { minute ->
+                      alarmPending(context, minute, noCreate = true)?.let { alarm.cancel(it); it.cancel() }
+                  }
+                  target.forEach { scheduleTime(context, it) }
+                  prefs.edit().putString("times", target.sorted().joinToString(",")).apply()
+              }
+          '''
+          replace_exact(reminders, old, new)
+          replace_exact(reminders,
+              '        ReminderJobs.scheduleDaily(context)\n        ReminderJobs.queueMaintenance(context)\n    }\n}\n\nclass SystemChangeReceiver',
+              '        ReminderJobs.scheduleTime(context,\n'
+              '            intent?.getIntExtra("reminderMinuteOfDay", 540) ?: 540)\n'
+              '        ReminderJobs.queueMaintenance(context)\n    }\n}\n\nclass SystemChangeReceiver')
+          replace_exact(reminders,
+              '        if (!ReminderJobs.notificationsAllowed(app)) return Result.success()\n'
+              '        // On reboot / app open, catch up if today\'s 9:00 alarm was missed.\n'
+              '        if (LocalTime.now().isBefore(LocalTime.of(9, 0))) return Result.success()\n'
+              '        val today = LocalDate.now()\n'
+              '        val events = app.signedInUid()?.let { app.dao.activeOwned(it) }\n'
+              '            ?: app.dao.activeGuests()\n',
+              '        val events = app.signedInUid()?.let { app.dao.activeOwned(it) }\n'
+              '            ?: app.dao.activeGuests()\n'
+              '        ReminderJobs.reconcileTimeAlarms(app, events)\n'
+              '        if (!ReminderJobs.notificationsAllowed(app)) return Result.success()\n'
+              '        val now = LocalTime.now()\n'
+              '        val today = LocalDate.now()\n')
+          replace_exact(reminders,
+              '        for (event in events) {\n            for (days in DateRules.supportedReminders) {\n',
+              '        for (event in events) {\n'
+              '            val minute = event.reminderMinuteOfDay ?: 540\n'
+              '            if (now.isBefore(LocalTime.of(minute / 60, minute % 60))) continue\n'
+              '            for (days in DateRules.reminderDays(event.reminderDays)) {\n')
+
+          # 7. Add simple Default / Custom controls in the Android date editor.
+          activity = BASE / 'MainActivity.kt'
+          replace_exact(activity,
+              'import android.app.DatePickerDialog\n',
+              'import android.app.DatePickerDialog\nimport android.app.TimePickerDialog\n')
+          replace_exact(activity,
+              '            vm.save(editorEvent, draft.title, draft.category, draft.rule,\n'
+              '                draft.month, draft.day, draft.offset, draft.note)\n',
+              '            vm.save(editorEvent, draft.title, draft.category, draft.rule,\n'
+              '                draft.month, draft.day, draft.offset, draft.note,\n'
+              '                draft.reminderDays, draft.reminderMinuteOfDay)\n')
+          replace_exact(activity,
+              '    val month: Int, val day: Int, val offset: Int, val note: String\n',
+              '    val month: Int, val day: Int, val offset: Int, val note: String,\n'
+              '    val reminderDays: String?, val reminderMinuteOfDay: Int?\n')
+          replace_exact(activity,
+              '    var note by remember(original?.id) { mutableStateOf(original?.note.orEmpty()) }\n',
+              '    var note by remember(original?.id) { mutableStateOf(original?.note.orEmpty()) }\n'
+              '    var customDaysEnabled by remember(original?.id) { mutableStateOf(original?.reminderDays != null) }\n'
+              '    var customDaysText by remember(original?.id) {\n'
+              '        mutableStateOf(original?.reminderDays ?: "7,1,0")\n'
+              '    }\n'
+              '    var customTimeEnabled by remember(original?.id) {\n'
+              '        mutableStateOf(original?.reminderMinuteOfDay != null)\n'
+              '    }\n'
+              '    var minuteOfDay by remember(original?.id) {\n'
+              '        mutableStateOf(original?.reminderMinuteOfDay ?: 540)\n'
+              '    }\n')
+          replace_exact(activity,
+              '    val upcoming = runCatching { DateRules.nextOccurrence(rule, month, day, offset, current) }.getOrNull()\n',
+              '    val upcoming = runCatching { DateRules.nextOccurrence(rule, month, day, offset, current) }.getOrNull()\n'
+              '    val checkedDays = if (customDaysEnabled)\n'
+              '        runCatching { DateRules.parseReminderDays(customDaysText) }.getOrNull() else DateRules.supportedReminders\n')
+          replace_exact(activity,
+              '                Text("Reminders: 7 days before, 1 day before, and on the day (around 9 AM).",\n'
+              '                    style = MaterialTheme.typography.bodySmall)\n',
+              '''                Text("Reminders", style = MaterialTheme.typography.titleMedium)
+                          Text("When should NeverMiss remind you?", style = MaterialTheme.typography.bodySmall)
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              FilterChip(selected = !customDaysEnabled, onClick = { customDaysEnabled = false },
+                                  label = { Text("Default: 7, 1, 0 days") })
+                              FilterChip(selected = customDaysEnabled, onClick = { customDaysEnabled = true },
+                                  label = { Text("Custom") })
+                          }
+                          if (customDaysEnabled) {
+                              OutlinedTextField(
+                                  value = customDaysText,
+                                  onValueChange = { customDaysText = it.take(60) },
+                                  label = { Text("Days before the date") },
+                                  placeholder = { Text("30,14,3,0") },
+                                  supportingText = { Text("Comma-separated numbers from 0 to 365. 0 = on the day. Up to 12 reminders.") },
+                                  isError = checkedDays == null,
+                                  modifier = Modifier.fillMaxWidth(), singleLine = true
+                              )
+                              if (checkedDays == null) Text("Enter valid, non-repeating days to enable Save.",
+                                  color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                          }
+                          Text("Reminder time", style = MaterialTheme.typography.titleSmall)
+                          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                              FilterChip(selected = !customTimeEnabled, onClick = { customTimeEnabled = false },
+                                  label = { Text("Default: ~09:00") })
+                              FilterChip(selected = customTimeEnabled, onClick = { customTimeEnabled = true },
+                                  label = { Text("Custom") })
+                          }
+                          if (customTimeEnabled) {
+                              OutlinedButton(onClick = {
+                                  TimePickerDialog(context, { _, hour, minute ->
+                                      minuteOfDay = hour * 60 + minute
+                                  }, minuteOfDay / 60, minuteOfDay % 60, true).show()
+                              }) {
+                                  Text("Choose time: " + java.time.LocalTime.of(minuteOfDay / 60, minuteOfDay % 60)
+                                      .format(DateTimeFormatter.ofPattern("HH:mm")))
+                              }
+                          }
+                          Text("Reminders repeat annually. Android may deliver notifications after the selected time.",
+                              style = MaterialTheme.typography.bodySmall)
+          ''')
+          replace_exact(activity,
+              '                    Button(enabled = title.trim().isNotEmpty() && upcoming != null,\n'
+              '                        onClick = { onSave(Draft(title.trim(), category, rule, month, day, offset, note)) }) {\n',
+              '                    Button(enabled = title.trim().isNotEmpty() && upcoming != null && checkedDays != null,\n'
+              '                        onClick = { onSave(Draft(title.trim(), category, rule, month, day, offset, note,\n'
+              '                            if (customDaysEnabled) checkedDays!!.joinToString(",") else null,\n'
+              '                            if (customTimeEnabled) minuteOfDay else null)) }) {\n')
+
+          print('NeverMiss custom reminder patch applied successfully')
           PY
 
       - name: Compile signed debug APK
@@ -75,4 +368,3 @@ jobs:
           path: NeverMiss-Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
-          
